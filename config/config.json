@@ -1,0 +1,79 @@
+{
+  "datasetCommonParams": {
+    "dataset_root_dir": "/root/autodl-fs",
+    "mosi": {
+      "aligned": {
+        "featurePath": "MOSI/Processed/MOSI-unaligned.pkl",
+        "feature_dims": [768, 5, 20],
+        "train_samples": 1284,
+        "num_classes": 3,
+        "language": "en",
+        "KeyEval": "Loss"
+      },
+      "unaligned": {
+        "featurePath": "MOSI/Processed/MOSI-unaligned.pkl",
+        "feature_dims": [768, 5, 20],
+        "train_samples": 1284,
+        "num_classes": 3,
+        "language": "en",
+        "KeyEval": "Loss"
+      }
+    }
+  },
+  "DLF": {
+    "commonParams": {
+      "need_data_aligned": true,
+      "need_model_aligned": true,
+      "early_stop": 80,
+      "use_bert": true,
+      "use_finetune": true,
+      "attn_mask": true,
+      "update_epochs": 300,
+      "token_len": 8,
+      "token_dim": 128,
+      "proj_input_dim": 128,
+      "AHL_depth": 3,
+      "l_enc_heads": 8,
+      "l_enc_mlp_dim": 128,
+      "ahl_heads": 8,
+      "ahl_dim_head": 16,
+      "ahl_droup": 0.0,
+      "fusion_heads": 8,
+      "fusion_mlp_dim": 128,
+      "fusion_layer_depth": 2,
+      "rel_hidden_dim": 128,
+      "loss_w_task": 1.0,
+      "loss_w_orth": 0.07,
+      "loss_w_sep": 0.07,
+      "loss_w_pair": 0.06,
+      "loss_pair_margin": 0.2,
+      "ema_decay": 0.999,
+      "warmup_ratio": 0.1
+    },
+    "datasetParams": {
+      "mosi": {
+        "attn_dropout_a": 0.2,
+        "attn_dropout_v": 0,
+        "relu_dropout": 0,
+        "embed_dropout": 0.2,
+        "res_dropout": 0,
+        "batch_size": 64,
+        "learning_rate": 0.00008,
+        "bert_learning_rate": 0.00001,
+        "min_learning_rate": 0.000001,
+        "nlevels": 2,
+        "conv1d_kernel_size_l": 5,
+        "conv1d_kernel_size_a": 5,
+        "conv1d_kernel_size_v": 5,
+        "text_dropout": 0.5,
+        "attn_dropout": 0.3,
+        "output_dropout": 0.5,
+        "grad_clip": 0.6,
+        "patience": 3,
+        "weight_decay": 0.01,
+        "transformers": "bert",
+        "pretrained": "bert-base-uncased"
+      }
+    }
+  }
+}
