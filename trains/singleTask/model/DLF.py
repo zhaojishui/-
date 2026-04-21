@@ -1,12 +1,13 @@
 """
-Hierarchical shared decomposition + reliability-constrained semantic injection backbone.
+Tri-subspaces disentanglement backbone for multimodal sentiment analysis.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import almt
 from ...subNets.BertTextEncoder import BertTextEncoder
 from ...subNets.transformers_encoder.transformer import TransformerEncoder
-import almt
 
 
 class DLF(nn.Module):
@@ -39,22 +40,43 @@ class DLF(nn.Module):
         self.attn_mask = args.attn_mask
 
         # 1) Unimodal projection
-        self.proj_l = nn.Conv1d(self.orig_d_l, self.d_l, kernel_size=args.conv1d_kernel_size_l, padding=0, bias=False)
-        self.proj_a = nn.Conv1d(self.orig_d_a, self.d_a, kernel_size=args.conv1d_kernel_size_a, padding=0, bias=False)
-        self.proj_v = nn.Conv1d(self.orig_d_v, self.d_v, kernel_size=args.conv1d_kernel_size_v, padding=0, bias=False)
+        self.proj_l = nn.Conv1d(
+            self.orig_d_l, self.d_l, kernel_size=args.conv1d_kernel_size_l, padding=0, bias=False
+        )
+        self.proj_a = nn.Conv1d(
+            self.orig_d_a, self.d_a, kernel_size=args.conv1d_kernel_size_a, padding=0, bias=False
+        )
+        self.proj_v = nn.Conv1d(
+            self.orig_d_v, self.d_v, kernel_size=args.conv1d_kernel_size_v, padding=0, bias=False
+        )
 
-        # 2) Hierarchical disentanglement encoders
-        self.encoder_p_l = self.get_network(self_type='l', layers=self.layers)
-        self.encoder_p_a = self.get_network(self_type='a', layers=self.layers)
-        self.encoder_p_v = self.get_network(self_type='v', layers=self.layers)
-        self.encoder_shared = self.get_network(self_type='l', layers=self.layers)
+        # 2) Modality encoders (private backbone features)
+        self.encoder_l = self.get_network(self_type='l', layers=self.layers)
+        self.encoder_a = self.get_network(self_type='a', layers=self.layers)
+        self.encoder_v = self.get_network(self_type='v', layers=self.layers)
 
+        # 3) Tri-subspaces heads: private, common, and pairwise-shared
+        self.private_proj_l = nn.Linear(self.d_l, self.d_l)
+        self.private_proj_a = nn.Linear(self.d_a, self.d_a)
+        self.private_proj_v = nn.Linear(self.d_v, self.d_v)
+
+        self.common_proj_l = nn.Linear(self.d_l, self.d_l)
+        self.common_proj_a = nn.Linear(self.d_a, self.d_a)
+        self.common_proj_v = nn.Linear(self.d_v, self.d_v)
         self.global_shared_proj = nn.Linear(self.d_l, self.d_l)
-        self.pair_proj_la = nn.Linear(self.d_l * 2, self.d_l)
-        self.pair_proj_lv = nn.Linear(self.d_l * 2, self.d_l)
-        self.pair_proj_av = nn.Linear(self.d_l * 2, self.d_l)
 
-        # 3) Reliability estimator
+        self.pair_la_l = nn.Linear(self.d_l, self.d_l)
+        self.pair_la_a = nn.Linear(self.d_a, self.d_l)
+        self.pair_lv_l = nn.Linear(self.d_l, self.d_l)
+        self.pair_lv_v = nn.Linear(self.d_v, self.d_l)
+        self.pair_av_a = nn.Linear(self.d_a, self.d_l)
+        self.pair_av_v = nn.Linear(self.d_v, self.d_l)
+
+        self.pair_fuse_la = nn.Linear(self.d_l * 2, self.d_l)
+        self.pair_fuse_lv = nn.Linear(self.d_l * 2, self.d_l)
+        self.pair_fuse_av = nn.Linear(self.d_l * 2, self.d_l)
+
+        # 4) Reliability estimator and semantic injection
         rel_hidden_dim = getattr(args, 'rel_hidden_dim', self.d_l)
         self.reliability_scorer = nn.Sequential(
             nn.Linear(self.d_l * 3, rel_hidden_dim),
@@ -63,7 +85,6 @@ class DLF(nn.Module):
             nn.Sigmoid(),
         )
 
-        # 4) Reliability-constrained semantic injection
         self.inject_attn_l = nn.MultiheadAttention(self.d_l, self.num_heads, dropout=self.attn_dropout, batch_first=True)
         self.inject_attn_a = nn.MultiheadAttention(self.d_a, self.num_heads, dropout=self.attn_dropout_a, batch_first=True)
         self.inject_attn_v = nn.MultiheadAttention(self.d_v, self.num_heads, dropout=self.attn_dropout_v, batch_first=True)
@@ -75,7 +96,7 @@ class DLF(nn.Module):
         self.inject_gate_a = nn.Sequential(nn.Linear(2, self.d_a), nn.Sigmoid())
         self.inject_gate_v = nn.Sequential(nn.Linear(2, self.d_v), nn.Sigmoid())
 
-        # 5) Private-pairwise routing + global branch fusion
+        # 5) Routing and prediction heads
         router_in_dim = self.d_l * 3 + 3
         self.router = nn.Sequential(
             nn.Linear(router_in_dim, self.d_l),
@@ -108,8 +129,6 @@ class DLF(nn.Module):
             embed_dim, attn_dropout = self.d_a, self.attn_dropout_a
         elif self_type in ['v', 'lv', 'av']:
             embed_dim, attn_dropout = self.d_v, self.attn_dropout_v
-        elif self_type in ['l_mem', 'a_mem', 'v_mem']:
-            embed_dim, attn_dropout = self.d_l, self.attn_dropout
         else:
             raise ValueError("Unknown network type")
 
@@ -130,7 +149,6 @@ class DLF(nn.Module):
 
     def _inject_private(self, p_m, pairwise_memory, r_m, r_other_mean, attn_layer, gate_layer, almt_module, pair_x, pair_y):
         context, _ = attn_layer(query=p_m, key=pairwise_memory, value=pairwise_memory)
-        # ALMT-enhanced local correction from {private, related pairwise shared, related pairwise shared}.
         _, local_feat = almt_module(p_m, pair_x, pair_y)
         local_ctx = local_feat.unsqueeze(1).expand_as(context)
         context = context + local_ctx
@@ -146,41 +164,35 @@ class DLF(nn.Module):
         x_a = audio.transpose(1, 2)
         x_v = video.transpose(1, 2)
 
-        proj_x_l = self.proj_l(x_l).permute(2, 0, 1)
-        proj_x_a = self.proj_a(x_a).permute(2, 0, 1)
-        proj_x_v = self.proj_v(x_v).permute(2, 0, 1)
+        h_l = self.proj_l(x_l).permute(0, 2, 1)
+        h_a = self.proj_a(x_a).permute(0, 2, 1)
+        h_v = self.proj_v(x_v).permute(0, 2, 1)
 
-        # private features (seq, batch, dim)
-        p_l = self.encoder_p_l(proj_x_l)
-        p_a = self.encoder_p_a(proj_x_a)
-        p_v = self.encoder_p_v(proj_x_v)
 
-        # modality-shared candidates (seq, batch, dim)
-        c_l = self.encoder_shared(proj_x_l)
-        c_a = self.encoder_shared(proj_x_a)
-        c_v = self.encoder_shared(proj_x_v)
+        min_t = min(h_l.size(1), h_a.size(1), h_v.size(1))
+        h_l, h_a, h_v = h_l[:, :min_t, :], h_a[:, :min_t, :], h_v[:, :min_t, :]
 
-        # switch to batch-first for fusion/injection
-        p_l = p_l.permute(1, 0, 2)
-        p_a = p_a.permute(1, 0, 2)
-        p_v = p_v.permute(1, 0, 2)
+        # Tri-subspaces decomposition
+        p_l = self.private_proj_l(h_l)
+        p_a = self.private_proj_a(h_a)
+        p_v = self.private_proj_v(h_v)
 
-        c_l = c_l.permute(1, 0, 2)
-        c_a = c_a.permute(1, 0, 2)
-        c_v = c_v.permute(1, 0, 2)
-
-        # Align temporal length for cross-modal shared decomposition.
-        min_t = min(c_l.size(1), c_a.size(1), c_v.size(1))
-        c_l, c_a, c_v = c_l[:, :min_t, :], c_a[:, :min_t, :], c_v[:, :min_t, :]
-        p_l, p_a, p_v = p_l[:, :min_t, :], p_a[:, :min_t, :], p_v[:, :min_t, :]
-
-        # hierarchical shared decomposition
+        c_l = self.common_proj_l(h_l)
+        c_a = self.common_proj_a(h_a)
+        c_v = self.common_proj_v(h_v)
         s_g = self.global_shared_proj((c_l + c_a + c_v) / 3.0)
-        s_la = self.pair_proj_la(torch.cat([c_l, c_a], dim=-1))
-        s_lv = self.pair_proj_lv(torch.cat([c_l, c_v], dim=-1))
-        s_av = self.pair_proj_av(torch.cat([c_a, c_v], dim=-1))
 
-        # reliability scores r_l, r_a, r_v in [0,1]
+        q_la_l = self.pair_la_l(h_l)
+        q_la_a = self.pair_la_a(h_a)
+        q_lv_l = self.pair_lv_l(h_l)
+        q_lv_v = self.pair_lv_v(h_v)
+        q_av_a = self.pair_av_a(h_a)
+        q_av_v = self.pair_av_v(h_v)
+
+        s_la = self.pair_fuse_la(torch.cat([q_la_l, q_la_a], dim=-1))
+        s_lv = self.pair_fuse_lv(torch.cat([q_lv_l, q_lv_v], dim=-1))
+        s_av = self.pair_fuse_av(torch.cat([q_av_a, q_av_v], dim=-1))
+
         pooled_l = self._pool(c_l)
         pooled_a = self._pool(c_a)
         pooled_v = self._pool(c_v)
@@ -191,12 +203,10 @@ class DLF(nn.Module):
         r_other_a = (r_l + r_v) / 2.0
         r_other_v = (r_l + r_a) / 2.0
 
-        # pairwise memories for each private branch
         mem_l = torch.cat([s_la, s_lv], dim=1)
         mem_a = torch.cat([s_la, s_av], dim=1)
         mem_v = torch.cat([s_lv, s_av], dim=1)
 
-        # reliability-constrained semantic injection
         p_tilde_l, g_l = self._inject_private(
             p_l, mem_l, r_l, r_other_l, self.inject_attn_l, self.inject_gate_l, self.local_almt_l, s_la, s_lv
         )
@@ -207,7 +217,6 @@ class DLF(nn.Module):
             p_v, mem_v, r_v, r_other_v, self.inject_attn_v, self.inject_gate_v, self.local_almt_v, s_lv, s_av
         )
 
-        # pooled candidates for private-pairwise routing
         feat_pl = self._pool(p_tilde_l)
         feat_pa = self._pool(p_tilde_a)
         feat_pv = self._pool(p_tilde_v)
@@ -219,12 +228,7 @@ class DLF(nn.Module):
             self.phi_private_v(feat_pv),
         ]
 
-        router_input = torch.cat([
-            feat_pl,
-            feat_pa,
-            feat_pv,
-            reliability,
-        ], dim=-1)
+        router_input = torch.cat([feat_pl, feat_pa, feat_pv, reliability], dim=-1)
         router_logits = self.router(router_input)
         router_weights = F.softmax(router_logits, dim=-1)
 
@@ -239,7 +243,9 @@ class DLF(nn.Module):
         global_repr = global_repr * branch_weights[:, 1:2]
         final_repr = torch.cat([pair_repr, global_repr], dim=-1)
 
-        fused_proj = self.proj2(F.dropout(F.relu(self.proj1(final_repr), inplace=True), p=self.output_dropout, training=self.training))
+        fused_proj = self.proj2(
+            F.dropout(F.relu(self.proj1(final_repr), inplace=True), p=self.output_dropout, training=self.training)
+        )
         fused_proj = fused_proj + final_repr
 
         output = self.out_layer(fused_proj)
@@ -256,7 +262,16 @@ class DLF(nn.Module):
             'p_tilde_l': p_tilde_l,
             'p_tilde_a': p_tilde_a,
             'p_tilde_v': p_tilde_v,
+            'c_l': c_l,
+            'c_a': c_a,
+            'c_v': c_v,
             's_g': s_g,
+            'q_la_l': q_la_l,
+            'q_la_a': q_la_a,
+            'q_lv_l': q_lv_l,
+            'q_lv_v': q_lv_v,
+            'q_av_a': q_av_a,
+            'q_av_v': q_av_v,
             's_la': s_la,
             's_lv': s_lv,
             's_av': s_av,

@@ -2,8 +2,8 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from multihead_attention import MultiheadAttention
-from position_embedding import SinusoidalPositionalEmbedding
+from .multihead_attention import MultiheadAttention
+from .position_embedding import SinusoidalPositionalEmbedding
 
 class TransformerEncoder(nn.Module):
     """

@@ -13,6 +13,43 @@ from tqdm import tqdm
 
 from ..utils import MetricsTop, dict_to_str
 
+class TopKModelSaver:
+    def __init__(self, k=3, mode='min', save_dir='./topk_models'):
+        self.k = k
+        self.mode = mode
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.topk = []  # [(score, path)]
+
+    def _is_better(self, a, b):
+        return a < b if self.mode == 'min' else a > b
+
+    def update(self, score, model, epoch):
+        save_path = os.path.join(
+            self.save_dir, f"model_epoch{epoch}_loss{score:.4f}.pt"
+        )
+
+        if len(self.topk) < self.k:
+            torch.save(model.state_dict(), save_path)
+            self.topk.append((score, save_path))
+            return
+
+        # 找最差（loss 最大）
+        worst_idx = max(range(len(self.topk)), key=lambda i: self.topk[i][0])
+        worst_score, worst_path = self.topk[worst_idx]
+
+        if self._is_better(score, worst_score):
+            torch.save(model.state_dict(), save_path)
+
+            if os.path.exists(worst_path):
+                os.remove(worst_path)
+
+            self.topk[worst_idx] = (score, save_path)
+
+    def get_paths(self):
+        return [p for _, p in sorted(self.topk, key=lambda x: x[0])]
+
+
 logger = logging.getLogger('MMSA')
 
 
@@ -55,8 +92,9 @@ class DLF():
         # Loss weights (paper-friendly defaults, configurable via json)
         self.w_task = getattr(args, 'loss_w_task', 1.0)
         self.w_orth = getattr(args, 'loss_w_orth', 0.05)
-        self.w_sep = getattr(args, 'loss_w_sep', 0.05)
-        self.w_pair = getattr(args, 'loss_w_pair', 0.05)
+        self.w_common = getattr(args, 'loss_w_common', getattr(args, 'loss_w_sep', 0.05))
+        self.w_pair_align = getattr(args, 'loss_w_pair_align', getattr(args, 'loss_w_pair', 0.05))
+        self.w_decouple = getattr(args, 'loss_w_decouple', 0.05)
         self.pair_margin = getattr(args, 'loss_pair_margin', 0.2)
         self.ema_decay = getattr(args, 'ema_decay', 0.999)
         self.warmup_ratio = getattr(args, 'warmup_ratio', 0.1)
@@ -120,79 +158,115 @@ class DLF():
         return (cross ** 2).mean()
 
     def _compute_losses(self, output, labels, reg_scale=1.0):
-        # 1) Task loss (final + global + local branch)
+        # 1) Task loss (final + auxiliary common/pair branches)
         loss_task_main = self.criterion(output['output_logit'], labels)
         loss_task_s = self.criterion(output['logits_s'], labels)
         loss_task_c = self.criterion(output['logits_c'], labels)
         loss_task = loss_task_main + 0.5 * (loss_task_s + loss_task_c)
 
-        # 2) Disentanglement constraints
+        # 2) Tri-subspaces features
         p_l, p_a, p_v = output['p_l'], output['p_a'], output['p_v']
+        c_l, c_a, c_v = output['c_l'], output['c_a'], output['c_v']
         s_g = output['s_g']
         s_la, s_lv, s_av = output['s_la'], output['s_lv'], output['s_av']
+        q_la_l, q_la_a = output['q_la_l'], output['q_la_a']
+        q_lv_l, q_lv_v = output['q_lv_l'], output['q_lv_v']
+        q_av_a, q_av_v = output['q_av_a'], output['q_av_v']
 
-        # A) private and global shared orthogonality / decorrelation
-        loss_orth = self._fro_dot_loss(p_l, s_g) + self._fro_dot_loss(p_a, s_g) + self._fro_dot_loss(p_v, s_g)
-
-        # B) pairwise shared and global shared redundancy reduction
-        loss_sep = (
-            self._fro_dot_loss(s_la, s_g)
-            + self._fro_dot_loss(s_lv, s_g)
-            + self._fro_dot_loss(s_av, s_g)
+        # A) Orthogonality/decorrelation across subspaces
+        loss_orth = (
+            self._fro_dot_loss(p_l, s_g) + self._fro_dot_loss(p_a, s_g) + self._fro_dot_loss(p_v, s_g)
+            + self._fro_dot_loss(p_l, s_la) + self._fro_dot_loss(p_l, s_lv)
+            + self._fro_dot_loss(p_a, s_la) + self._fro_dot_loss(p_a, s_av)
+            + self._fro_dot_loss(p_v, s_lv) + self._fro_dot_loss(p_v, s_av)
+            + self._fro_dot_loss(s_la, s_g) + self._fro_dot_loss(s_lv, s_g) + self._fro_dot_loss(s_av, s_g)
         )
 
-        # C) pairwise shared should approach related two-modal common semantics and repel the unrelated modality
-        target_la = 0.5 * (p_l + p_a)
-        target_lv = 0.5 * (p_l + p_v)
-        target_av = 0.5 * (p_a + p_v)
+        # B) Common-subspace alignment among all modalities
+        loss_common = (
+            self._pooled_cosine_loss(c_l, c_a)
+            + self._pooled_cosine_loss(c_l, c_v)
+            + self._pooled_cosine_loss(c_a, c_v)
+            + self._pooled_cosine_loss(s_g, c_l)
+            + self._pooled_cosine_loss(s_g, c_a)
+            + self._pooled_cosine_loss(s_g, c_v)
+        )
+
+        # C) Pairwise-shared alignment to corresponding modality pair
+        loss_pair_align = (
+            self._pooled_cosine_loss(q_la_l, q_la_a)
+            + self._pooled_cosine_loss(s_la, q_la_l)
+            + self._pooled_cosine_loss(s_la, q_la_a)
+            + self._pooled_cosine_loss(q_lv_l, q_lv_v)
+            + self._pooled_cosine_loss(s_lv, q_lv_l)
+            + self._pooled_cosine_loss(s_lv, q_lv_v)
+            + self._pooled_cosine_loss(q_av_a, q_av_v)
+            + self._pooled_cosine_loss(s_av, q_av_a)
+            + self._pooled_cosine_loss(s_av, q_av_v)
+        )
 
         s_la_pool = s_la.mean(dim=1)
         s_lv_pool = s_lv.mean(dim=1)
         s_av_pool = s_av.mean(dim=1)
-        t_la_pool = target_la.mean(dim=1)
-        t_lv_pool = target_lv.mean(dim=1)
-        t_av_pool = target_av.mean(dim=1)
+        q_la_l_pool = q_la_l.mean(dim=1)
+        q_la_a_pool = q_la_a.mean(dim=1)
+        q_lv_l_pool = q_lv_l.mean(dim=1)
+        q_lv_v_pool = q_lv_v.mean(dim=1)
+        q_av_a_pool = q_av_a.mean(dim=1)
+        q_av_v_pool = q_av_v.mean(dim=1)
         p_l_pool = p_l.mean(dim=1)
         p_a_pool = p_a.mean(dim=1)
         p_v_pool = p_v.mean(dim=1)
 
-        pos_la = 1.0 - F.cosine_similarity(s_la_pool, t_la_pool, dim=-1)
-        pos_lv = 1.0 - F.cosine_similarity(s_lv_pool, t_lv_pool, dim=-1)
-        pos_av = 1.0 - F.cosine_similarity(s_av_pool, t_av_pool, dim=-1)
+        # D) Decoupling supervisor: pairwise-shared should be closer to related modalities
+        # than the unrelated private subspace.
+        pos_la = 0.5 * (
+            F.cosine_similarity(s_la_pool, q_la_l_pool, dim=-1)
+            + F.cosine_similarity(s_la_pool, q_la_a_pool, dim=-1)
+        )
+        pos_lv = 0.5 * (
+            F.cosine_similarity(s_lv_pool, q_lv_l_pool, dim=-1)
+            + F.cosine_similarity(s_lv_pool, q_lv_v_pool, dim=-1)
+        )
+        pos_av = 0.5 * (
+            F.cosine_similarity(s_av_pool, q_av_a_pool, dim=-1)
+            + F.cosine_similarity(s_av_pool, q_av_v_pool, dim=-1)
+        )
 
         neg_la = F.relu(
             F.cosine_similarity(s_la_pool, p_v_pool, dim=-1)
-            - F.cosine_similarity(s_la_pool, t_la_pool, dim=-1)
+            - pos_la
             + self.pair_margin
         )
         neg_lv = F.relu(
             F.cosine_similarity(s_lv_pool, p_a_pool, dim=-1)
-            - F.cosine_similarity(s_lv_pool, t_lv_pool, dim=-1)
+            - pos_lv
             + self.pair_margin
         )
         neg_av = F.relu(
             F.cosine_similarity(s_av_pool, p_l_pool, dim=-1)
-            - F.cosine_similarity(s_av_pool, t_av_pool, dim=-1)
+            - pos_av
             + self.pair_margin
         )
 
-        loss_pair = (
-            pos_la.mean() + pos_lv.mean() + pos_av.mean()
-            + neg_la.mean() + neg_lv.mean() + neg_av.mean()
+        loss_decouple = (
+            neg_la.mean() + neg_lv.mean() + neg_av.mean()
         )
 
         total_loss = (
             self.w_task * loss_task
             + (self.w_orth * reg_scale) * loss_orth
-            + (self.w_sep * reg_scale) * loss_sep
-            + (self.w_pair * reg_scale) * loss_pair
+            + (self.w_common * reg_scale) * loss_common
+            + (self.w_pair_align * reg_scale) * loss_pair_align
+            + (self.w_decouple * reg_scale) * loss_decouple
         )
 
         loss_items = {
             'task': loss_task.detach().item(),
             'orth': loss_orth.detach().item(),
-            'sep': loss_sep.detach().item(),
-            'pair': loss_pair.detach().item(),
+            'common': loss_common.detach().item(),
+            'pair_align': loss_pair_align.detach().item(),
+            'decouple': loss_decouple.detach().item(),
         }
         return total_loss, loss_items
 
@@ -203,7 +277,7 @@ class DLF():
         best_valid = float('inf')
         best_epoch = 0
         best_state_dict = copy.deepcopy(model.state_dict())
-
+        topk_saver = TopKModelSaver(k=3, mode='min', save_dir='./topk_models')
         train_losses, val_losses = [], []
         train_has0_acc, val_has0_acc = [], []
         train_non0_acc, val_non0_acc = [], []
@@ -217,7 +291,7 @@ class DLF():
             y_pred, y_true = [], []
             model.train()
             train_loss = 0.0
-            epoch_parts = {'task': 0.0, 'orth': 0.0, 'sep': 0.0, 'pair': 0.0}
+            epoch_parts = {'task': 0.0, 'orth': 0.0, 'common': 0.0, 'pair_align': 0.0, 'decouple': 0.0}
 
             with tqdm(dataloader['train'], desc=f"Epoch {epoch + 1}") as td:
                 for batch_data in td:
@@ -256,11 +330,17 @@ class DLF():
                 f">> Epoch: {epoch + 1} TRAIN -({self.args.model_name}) [{epoch + 1}/{self.args.cur_seed}] "
                 f">> total_loss: {round(train_loss, 4)} | "
                 f"task: {epoch_parts['task']:.4f} orth: {epoch_parts['orth']:.4f} "
-                f"sep: {epoch_parts['sep']:.4f} pair: {epoch_parts['pair']:.4f} "
+                f"common: {epoch_parts['common']:.4f} pair_align: {epoch_parts['pair_align']:.4f} "
+                f"decouple: {epoch_parts['decouple']:.4f} "
                 f"{dict_to_str(train_results)}"
             )
 
-            val_results = self.do_test(model, dataloader['valid'], mode="VAL", ema=ema)
+            val_results, _, _ = self.do_test(model, dataloader['valid'], mode="VAL", ema=ema)
+            # ===== Top-K 保存（用 EMA 权重）=====
+            ema.apply_shadow(model)
+            topk_saver.update(val_results['Loss'], model, epoch + 1)
+            ema.restore(model)
+
             scheduler.step()
 
             train_losses.append(train_loss)
@@ -303,9 +383,36 @@ class DLF():
         torch.save(best_state_dict, best_path)
 
         model.load_state_dict(best_state_dict)
-        best_test = self.do_test(model, dataloader['test'], mode="TEST")
+        best_test, _, _ = self.do_test(model, dataloader['test'], mode="TEST")
         logger.info(f"Best Epoch: {best_epoch} | Best Test: {dict_to_str(best_test)}")
+        # ===== Top-K Ensemble Test =====
+        topk_paths = topk_saver.get_paths()
+        logger.info(f"Top-K models: {topk_paths}")
+        all_preds = []
+        all_true = None
+        for path in topk_paths:
+            model.load_state_dict(torch.load(path))
+            ema_tmp = ModelEMA(model, decay=self.ema_decay)
 
+            # ⚠️ 关键：让 EMA shadow = 当前模型（恢复 EMA状态）
+            ema_tmp.shadow = {
+                name: param.detach().clone()
+                for name, param in model.named_parameters()
+                if param.requires_grad
+            }
+
+            # ✅ 关键：用你原来的测试函数（自动带 EMA）
+            _, pred, true = self.do_test(model, dataloader['test'], mode="TEST", ema=ema_tmp  )
+
+            all_preds.append(pred)
+
+            if all_true is None:
+                all_true = true
+        # ===== 平均 =====
+        final_pred = torch.mean(torch.stack(all_preds), dim=0)
+
+        best_test = self.metrics(final_pred, all_true)
+        logger.info(f"Top-K Ensemble Test: {dict_to_str(best_test)}")
         epochs = range(1, len(train_losses) + 1)
         plt.figure(figsize=(14, 18))
 
@@ -387,4 +494,4 @@ class DLF():
         eval_results = self.metrics(pred, true)#遍历完数据集后，这里计算分类指标和回归指标
         eval_results['Loss'] = round(eval_loss, 4)#新增Loss作为key，eval_loss作为值
         logger.info(f"{mode}-({self.args.model_name}) >> {dict_to_str(eval_results)}")
-        return eval_results
+        return eval_results,pred, true

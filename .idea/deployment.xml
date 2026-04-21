@@ -31,6 +31,20 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="root@connect.nmb1.seetacloud.com:12366 password (3)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/三重解耦/DLFbianticundang3" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@connect.nmb1.seetacloud.com:12366 password (4)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/三重解耦2" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="root@connect.nmb1.seetacloud.com:13231 password">
         <serverdata>
           <mappings>
