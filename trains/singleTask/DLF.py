@@ -13,42 +13,6 @@ from tqdm import tqdm
 
 from ..utils import MetricsTop, dict_to_str
 
-class TopKModelSaver:
-    def __init__(self, k=3, mode='min', save_dir='./topk_models'):
-        self.k = k
-        self.mode = mode
-        self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
-        self.topk = []  # [(score, path)]
-
-    def _is_better(self, a, b):
-        return a < b if self.mode == 'min' else a > b
-
-    def update(self, score, model, epoch):
-        save_path = os.path.join(
-            self.save_dir, f"model_epoch{epoch}_loss{score:.4f}.pt"
-        )
-
-        if len(self.topk) < self.k:
-            torch.save(model.state_dict(), save_path)
-            self.topk.append((score, save_path))
-            return
-
-        # 找最差（loss 最大）
-        worst_idx = max(range(len(self.topk)), key=lambda i: self.topk[i][0])
-        worst_score, worst_path = self.topk[worst_idx]
-
-        if self._is_better(score, worst_score):
-            torch.save(model.state_dict(), save_path)
-
-            if os.path.exists(worst_path):
-                os.remove(worst_path)
-
-            self.topk[worst_idx] = (score, save_path)
-
-    def get_paths(self):
-        return [p for _, p in sorted(self.topk, key=lambda x: x[0])]
-
 
 logger = logging.getLogger('MMSA')
 
@@ -98,6 +62,9 @@ class DLF():
         self.pair_margin = getattr(args, 'loss_pair_margin', 0.2)
         self.ema_decay = getattr(args, 'ema_decay', 0.999)
         self.warmup_ratio = getattr(args, 'warmup_ratio', 0.1)
+        self.reg_start_ratio = getattr(args, 'reg_start_ratio', 0.1)
+        self.reg_decay_start_ratio = getattr(args, 'reg_decay_start_ratio', 0.4)
+        self.reg_min_scale = getattr(args, 'reg_min_scale', 0.2)
 
     def _build_optimizer_and_scheduler(self, model):
         base_lr = self.args.learning_rate
@@ -146,43 +113,69 @@ class DLF():
 
     @staticmethod
     def _pooled_cosine_loss(x, y):
-        x_pool = x.mean(dim=1)
-        y_pool = y.mean(dim=1)
+        x_pool = x.mean(dim=1) if x.dim() == 3 else x
+        y_pool = y.mean(dim=1) if y.dim() == 3 else y
         return 1.0 - F.cosine_similarity(x_pool, y_pool, dim=-1).mean()
 
     @staticmethod
     def _fro_dot_loss(x, y):
-        # x,y: [B, T, D], encourage orthogonality via ||X^T Y||_F^2
-        x_t = x.transpose(1, 2)
-        cross = torch.bmm(x_t, y)
+        # Support different sequence lengths by first reducing each representation to one vector.
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+        if y.dim() == 3:
+            y = y.mean(dim=1)
+        cross = torch.bmm(x.unsqueeze(2), y.unsqueeze(1))
         return (cross ** 2).mean()
 
+    @staticmethod
+    def _reduce_feat(x):
+        return x.mean(dim=1) if x.dim() == 3 else x
+
+    def _get_reg_scale(self, epoch_idx):
+        total_epochs = max(1, self.args.update_epochs)
+        progress = float(epoch_idx + 1) / float(total_epochs)
+
+        if progress <= self.reg_start_ratio:
+            return max(progress / max(self.reg_start_ratio, 1e-8), 1e-8)
+
+        if progress <= self.reg_decay_start_ratio:
+            return 1.0
+
+        decay_progress = (progress - self.reg_decay_start_ratio) / max(1.0 - self.reg_decay_start_ratio, 1e-8)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return self.reg_min_scale + (1.0 - self.reg_min_scale) * cosine
+
     def _compute_losses(self, output, labels, reg_scale=1.0):
-        # 1) Task loss (final + auxiliary common/pair branches)
+        # 1) Task loss (final + auxiliary common/cross branches)
         loss_task_main = self.criterion(output['output_logit'], labels)
         loss_task_s = self.criterion(output['logits_s'], labels)
         loss_task_c = self.criterion(output['logits_c'], labels)
-        loss_task = loss_task_main + 0.5 * (loss_task_s + loss_task_c)
+        loss_task = loss_task_main + 0.3 * (loss_task_s + loss_task_c)
 
-        # 2) Tri-subspaces features
         p_l, p_a, p_v = output['p_l'], output['p_a'], output['p_v']
         c_l, c_a, c_v = output['c_l'], output['c_a'], output['c_v']
         s_g = output['s_g']
+        s_g_l, s_g_a, s_g_v = output['s_g_l'], output['s_g_a'], output['s_g_v']
         s_la, s_lv, s_av = output['s_la'], output['s_lv'], output['s_av']
+        s_la_l, s_la_a = output['s_la_l'], output['s_la_a']
+        s_lv_l, s_lv_v = output['s_lv_l'], output['s_lv_v']
+        s_av_a, s_av_v = output['s_av_a'], output['s_av_v']
         q_la_l, q_la_a = output['q_la_l'], output['q_la_a']
         q_lv_l, q_lv_v = output['q_lv_l'], output['q_lv_v']
         q_av_a, q_av_v = output['q_av_a'], output['q_av_v']
+        shared_l, shared_a, shared_v = output['shared_l'], output['shared_a'], output['shared_v']
 
-        # A) Orthogonality/decorrelation across subspaces
+        # A) Private and shared subspaces should stay disentangled.
         loss_orth = (
-            self._fro_dot_loss(p_l, s_g) + self._fro_dot_loss(p_a, s_g) + self._fro_dot_loss(p_v, s_g)
-            + self._fro_dot_loss(p_l, s_la) + self._fro_dot_loss(p_l, s_lv)
-            + self._fro_dot_loss(p_a, s_la) + self._fro_dot_loss(p_a, s_av)
-            + self._fro_dot_loss(p_v, s_lv) + self._fro_dot_loss(p_v, s_av)
+            self._fro_dot_loss(p_l, s_g_l) + self._fro_dot_loss(p_a, s_g_a) + self._fro_dot_loss(p_v, s_g_v)
+            + self._fro_dot_loss(p_l, s_la_l) + self._fro_dot_loss(p_l, s_lv_l)
+            + self._fro_dot_loss(p_a, s_la_a) + self._fro_dot_loss(p_a, s_av_a)
+            + self._fro_dot_loss(p_v, s_lv_v) + self._fro_dot_loss(p_v, s_av_v)
             + self._fro_dot_loss(s_la, s_g) + self._fro_dot_loss(s_lv, s_g) + self._fro_dot_loss(s_av, s_g)
+            + self._fro_dot_loss(p_l, shared_l) + self._fro_dot_loss(p_a, shared_a) + self._fro_dot_loss(p_v, shared_v)
         )
 
-        # B) Common-subspace alignment among all modalities
+        # B) Common subspace should encode what is shared by all modalities.
         loss_common = (
             self._pooled_cosine_loss(c_l, c_a)
             + self._pooled_cosine_loss(c_l, c_v)
@@ -192,7 +185,7 @@ class DLF():
             + self._pooled_cosine_loss(s_g, c_v)
         )
 
-        # C) Pairwise-shared alignment to corresponding modality pair
+        # C) Pairwise shared subspaces should align only with their related modalities.
         loss_pair_align = (
             self._pooled_cosine_loss(q_la_l, q_la_a)
             + self._pooled_cosine_loss(s_la, q_la_l)
@@ -205,21 +198,20 @@ class DLF():
             + self._pooled_cosine_loss(s_av, q_av_v)
         )
 
-        s_la_pool = s_la.mean(dim=1)
-        s_lv_pool = s_lv.mean(dim=1)
-        s_av_pool = s_av.mean(dim=1)
-        q_la_l_pool = q_la_l.mean(dim=1)
-        q_la_a_pool = q_la_a.mean(dim=1)
-        q_lv_l_pool = q_lv_l.mean(dim=1)
-        q_lv_v_pool = q_lv_v.mean(dim=1)
-        q_av_a_pool = q_av_a.mean(dim=1)
-        q_av_v_pool = q_av_v.mean(dim=1)
-        p_l_pool = p_l.mean(dim=1)
-        p_a_pool = p_a.mean(dim=1)
-        p_v_pool = p_v.mean(dim=1)
+        s_la_pool = self._reduce_feat(s_la)
+        s_lv_pool = self._reduce_feat(s_lv)
+        s_av_pool = self._reduce_feat(s_av)
+        q_la_l_pool = self._reduce_feat(q_la_l)
+        q_la_a_pool = self._reduce_feat(q_la_a)
+        q_lv_l_pool = self._reduce_feat(q_lv_l)
+        q_lv_v_pool = self._reduce_feat(q_lv_v)
+        q_av_a_pool = self._reduce_feat(q_av_a)
+        q_av_v_pool = self._reduce_feat(q_av_v)
+        p_l_pool = self._reduce_feat(p_l)
+        p_a_pool = self._reduce_feat(p_a)
+        p_v_pool = self._reduce_feat(p_v)
 
-        # D) Decoupling supervisor: pairwise-shared should be closer to related modalities
-        # than the unrelated private subspace.
+        # D) Pair-specific decoupling: unrelated private information should stay away.
         pos_la = 0.5 * (
             F.cosine_similarity(s_la_pool, q_la_l_pool, dim=-1)
             + F.cosine_similarity(s_la_pool, q_la_a_pool, dim=-1)
@@ -251,6 +243,12 @@ class DLF():
 
         loss_decouple = (
             neg_la.mean() + neg_lv.mean() + neg_av.mean()
+            + self._fro_dot_loss(q_la_l, q_lv_l)
+            + self._fro_dot_loss(q_la_a, q_av_a)
+            + self._fro_dot_loss(q_lv_v, q_av_v)
+            + self._fro_dot_loss(s_la, s_lv)
+            + self._fro_dot_loss(s_la, s_av)
+            + self._fro_dot_loss(s_lv, s_av)
         )
 
         total_loss = (
@@ -277,7 +275,6 @@ class DLF():
         best_valid = float('inf')
         best_epoch = 0
         best_state_dict = copy.deepcopy(model.state_dict())
-        topk_saver = TopKModelSaver(k=3, mode='min', save_dir='./topk_models')
         train_losses, val_losses = [], []
         train_has0_acc, val_has0_acc = [], []
         train_non0_acc, val_non0_acc = [], []
@@ -303,8 +300,7 @@ class DLF():
                     labels = batch_data['labels']['M'].to(self.args.device).view(-1, 1)
 
                     output = model(text, audio, vision)
-                    reg_warmup_epochs = max(1, int(self.args.update_epochs * 0.3))
-                    reg_scale = min(1.0, float(epoch + 1) / float(reg_warmup_epochs))
+                    reg_scale = self._get_reg_scale(epoch)
                     combined_loss, loss_items = self._compute_losses(output, labels, reg_scale=reg_scale)
                     combined_loss.backward()
 
@@ -328,7 +324,7 @@ class DLF():
             train_results = self.metrics(pred, true)
             logger.info(
                 f">> Epoch: {epoch + 1} TRAIN -({self.args.model_name}) [{epoch + 1}/{self.args.cur_seed}] "
-                f">> total_loss: {round(train_loss, 4)} | "
+                f">> total_loss: {round(train_loss, 4)} | reg_scale: {reg_scale:.4f} "
                 f"task: {epoch_parts['task']:.4f} orth: {epoch_parts['orth']:.4f} "
                 f"common: {epoch_parts['common']:.4f} pair_align: {epoch_parts['pair_align']:.4f} "
                 f"decouple: {epoch_parts['decouple']:.4f} "
@@ -336,10 +332,6 @@ class DLF():
             )
 
             val_results, _, _ = self.do_test(model, dataloader['valid'], mode="VAL", ema=ema)
-            # ===== Top-K 保存（用 EMA 权重）=====
-            ema.apply_shadow(model)
-            topk_saver.update(val_results['Loss'], model, epoch + 1)
-            ema.restore(model)
 
             scheduler.step()
 
@@ -358,6 +350,8 @@ class DLF():
             train_non0_f1.append(train_results['Non0_F1_score'])
             val_non0_f1.append(val_results['Non0_F1_score'])
 
+
+
             train_mult5.append(train_results['Mult_acc_5'])
             val_mult5.append(val_results['Mult_acc_5'])
 
@@ -367,7 +361,7 @@ class DLF():
             train_mae.append(train_results['MAE'])
             val_mae.append(val_results['MAE'])
 
-            if val_results['Loss'] < best_valid:
+            if val_results['Loss'] > best_valid:
                 best_valid = val_results['Loss']
                 best_epoch = epoch + 1
                 ema.apply_shadow(model)
@@ -385,34 +379,6 @@ class DLF():
         model.load_state_dict(best_state_dict)
         best_test, _, _ = self.do_test(model, dataloader['test'], mode="TEST")
         logger.info(f"Best Epoch: {best_epoch} | Best Test: {dict_to_str(best_test)}")
-        # ===== Top-K Ensemble Test =====
-        topk_paths = topk_saver.get_paths()
-        logger.info(f"Top-K models: {topk_paths}")
-        all_preds = []
-        all_true = None
-        for path in topk_paths:
-            model.load_state_dict(torch.load(path))
-            ema_tmp = ModelEMA(model, decay=self.ema_decay)
-
-            # ⚠️ 关键：让 EMA shadow = 当前模型（恢复 EMA状态）
-            ema_tmp.shadow = {
-                name: param.detach().clone()
-                for name, param in model.named_parameters()
-                if param.requires_grad
-            }
-
-            # ✅ 关键：用你原来的测试函数（自动带 EMA）
-            _, pred, true = self.do_test(model, dataloader['test'], mode="TEST", ema=ema_tmp  )
-
-            all_preds.append(pred)
-
-            if all_true is None:
-                all_true = true
-        # ===== 平均 =====
-        final_pred = torch.mean(torch.stack(all_preds), dim=0)
-
-        best_test = self.metrics(final_pred, all_true)
-        logger.info(f"Top-K Ensemble Test: {dict_to_str(best_test)}")
         epochs = range(1, len(train_losses) + 1)
         plt.figure(figsize=(14, 18))
 

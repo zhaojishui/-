@@ -13,6 +13,7 @@ class MMDataset(Dataset):
         DATASET_MAP = {
             'mosi': self.__init_mosi,
             'mosei': self.__init_mosei,
+            'chsims':self.__init_sims
         }
         DATASET_MAP[args['dataset_name']]()
 

@@ -21,6 +21,25 @@ os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:2"
 logger = logging.getLogger('MMSA')
 
+
+def _save_results_csv(res_save_dir, dataset_name, model_name, result):
+    csv_file = Path(res_save_dir) / f"{dataset_name}.csv"
+    row = {"Time": formatted_now, "Model": model_name}
+    row.update(result)
+
+    if csv_file.is_file():
+        df = pd.read_csv(csv_file)
+    else:
+        df = pd.DataFrame(columns=list(row.keys()))
+
+    for key in row.keys():
+        if key not in df.columns:
+            df[key] = np.nan
+
+    df.loc[len(df)] = row
+    df.to_csv(csv_file, index=None)
+    logger.info(f"Results saved to {csv_file}.")
+
 def _set_logger(log_dir, model_name, dataset_name, verbose_level):
 
     # base logger
@@ -64,16 +83,22 @@ def DLF_run(
         raise ValueError(f"Config file {str(config_file)} not found.")
     if model_save_dir == "":
         model_save_dir = Path.home() / "MMSA" / "saved_models"
+    else:
+        model_save_dir = Path(model_save_dir)
     Path(model_save_dir).mkdir(parents=True, exist_ok=True)
     if res_save_dir == "":
         res_save_dir = Path.home() / "MMSA" / "results"
+    else:
+        res_save_dir = Path(res_save_dir)
     Path(res_save_dir).mkdir(parents=True, exist_ok=True)
     if log_dir == "":
         log_dir = Path.home() / "MMSA" / "logs"
+    else:
+        log_dir = Path(log_dir)
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     if gpu_ids is None:
         gpu_ids = [0]
-    seeds = seeds if seeds != [] else [1111, 1112, 1113, 1114, 1115]
+    seeds = seeds if seeds != [] else [1111]
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level)
     
 
@@ -86,40 +111,20 @@ def DLF_run(
     args['feature_T'] = feature_T
     args['feature_A'] = feature_A
     args['feature_V'] = feature_V
-
-
-
-    res_save_dir = Path(res_save_dir) / "normal"
-    res_save_dir.mkdir(parents=True, exist_ok=True)
+    res_save_dir.mkdir(parents=True, exist_ok=True)#测试结果保存
     model_results = []
     for i, seed in enumerate(seeds):
         setup_seed(seed)
         args['cur_seed'] = i + 1
         result = _run(args, num_workers, is_tune)
-        model_results.append(result)
-    if args.is_training:
-        criterions = list(model_results[0].keys())
-        # save result to csv
-        csv_file = res_save_dir / f"{dataset_name}.csv"
-        if csv_file.is_file():
-            df = pd.read_csv(csv_file)
-        else:
-            df = pd.DataFrame(columns=["Time"]+["Model"] + criterions)
-        # save results
-        res = [model_name]
-        for c in criterions:
-            values = [r[c] for r in model_results]
-            mean = round(np.mean(values)*100, 2)
-            std = round(np.std(values)*100, 2)
-            res.append((mean, std))
-        
-        res = [formatted_now]+res 
-        df.loc[len(df)] = res    
-        df.to_csv(csv_file, index=None)
-        logger.info(f"Results saved to {csv_file}.")
+        if result is not None:
+            model_results.append(result)
+
+    if len(model_results) > 0:
+        _save_results_csv(res_save_dir, dataset_name, model_name, model_results[-1])
 
 
-def _run(args, num_workers=4, from_sena=False):
+def _run(args, num_workers=0, from_sena=False):
 
     dataloader = MMDataLoader(args, num_workers)
 
@@ -144,14 +149,14 @@ def _run(args, num_workers=4, from_sena=False):
         if not Path(args.model_save_path).is_file():
             raise FileNotFoundError(f"Model checkpoint not found: {args.model_save_path}")
         model.load_state_dict(torch.load(args.model_save_path, map_location=args.device), strict=False)
-        results = trainer.do_test(model, dataloader['test'], mode="TEST")
+        results, _, _ = trainer.do_test(model, dataloader['test'], mode="TEST")
         return results
     #train
     else:
-        trainer.do_train(model, dataloader, return_epoch_results=from_sena)
+        result = trainer.do_train(model, dataloader, return_epoch_results=from_sena)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
         time.sleep(1)
-
+        return result

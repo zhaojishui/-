@@ -21,9 +21,13 @@ def get_config_regression(model_name, dataset_name, config_file=""):
         config_all = json.load(f)
     model_common_args = config_all[model_name]['commonParams']
     model_dataset_args = config_all[model_name]['datasetParams'][dataset_name]
-    dataset_args = config_all['datasetCommonParams'][dataset_name]
-    # use aligned feature if the model requires it, otherwise use unaligned feature
-    dataset_args = dataset_args['aligned'] if (model_common_args['need_data_aligned'] and 'aligned' in dataset_args) else dataset_args['unaligned']
+    dataset_all_args = config_all['datasetCommonParams'][dataset_name]
+    # Respect dataset-specific alignment overrides when selecting the feature file.
+    need_data_aligned = model_dataset_args.get(
+        'need_data_aligned',
+        model_common_args.get('need_data_aligned', False)
+    )
+    dataset_args = dataset_all_args['aligned'] if (need_data_aligned and 'aligned' in dataset_all_args) else dataset_all_args['unaligned']
 
     config = {}
     config['model_name'] = model_name
@@ -35,5 +39,4 @@ def get_config_regression(model_name, dataset_name, config_file=""):
     config = edict(config)
 
     return config
-
 

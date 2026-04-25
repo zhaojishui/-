@@ -14,7 +14,7 @@ class MetricsTop():
         self.metrics_dict = {
             'MOSI': self.__eval_mosi_regression,
             'MOSEI': self.__eval_mosei_regression,
-            'SIMS': self.__eval_sims_regression
+            'CHSIMS': self.__eval_sims_regression
         }
 
     def __multiclass_acc(self, y_pred, y_true):
