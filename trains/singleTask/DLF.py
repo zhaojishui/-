@@ -361,7 +361,7 @@ class DLF():
             train_mae.append(train_results['MAE'])
             val_mae.append(val_results['MAE'])
 
-            if val_results['Loss'] > best_valid:
+            if val_results['Loss'] < best_valid:
                 best_valid = val_results['Loss']
                 best_epoch = epoch + 1
                 ema.apply_shadow(model)
